@@ -203,6 +203,21 @@ static char usage_str[];
  */
 
 /*
+ * Copy digest into buf in readable Hex format
+ */
+void MD5Human(unsigned char digest[16], char *buf)
+{
+        int i, s;
+
+        for (i = 0; i < 16; i++) {
+                s = sprintf(buf, "%02x", digest[i]);
+                buf += s;
+        }
+        *buf = '\0';
+}
+
+
+/*
  * The 'fatal' macro will output a perror message (if errstring is !NULL)
  * and display a string (with variable arguments) and then exit with the 
  * specified exit value.
@@ -309,10 +324,11 @@ static inline void touch_memory(char *buf, size_t bsize)
 #if defined(PREP_BUFS)
 	memset(buf, 0, bsize);
 #else
-	size_t i;
+	memset(buf, 0, bsize);
+//	size_t i;
 
-	for (i = 0; i < bsize; i += pgsize)
-		buf[i] = 0;
+//	for (i = 0; i < bsize; i += pgsize)
+//		buf[i] = 0;
 #endif
 }
 
@@ -709,10 +725,12 @@ static void iocb_init(struct thr_info *tip, struct iocb_pkt *iocbp)
  * @n: Number of bytes to transfer
  * @off: Offset (in bytes)
  */
-static void iocb_setup(struct iocb_pkt *iocbp, int rw, int n, long long off)
+static void iocb_setup(struct iocb_pkt *iocbp, int rw, int n, long long off, char *digests)
 {
-	char *buf;
+	char *buf, *d, *b;
+	int i;
 	struct iocb *iop = &iocbp->iocb;
+	char temp_buf[64];
 
 	assert(rw == 0 || rw == 1);
 	assert(0 < n && (n % nb_sec) == 0);
@@ -737,7 +755,18 @@ prep:
 	else {
 		assert(write_enabled);
 		io_prep_pwrite(iop, iocbp->tip->ofd, buf, n, off);
+		/* set everything as zeroes */
 		touch_memory(buf, n);
+		d = digests;
+		b = buf;
+		for (i = 0; i < n / 4096; i++) {
+			if (verbose)
+				printf("print page %d\n", i);
+			MD5Human(d, temp_buf);
+			d += 16;
+			memcpy(b, temp_buf, strlen(temp_buf));
+			b += 4096;
+		}
 	}
 
 	iop->data = iocbp;
@@ -761,6 +790,9 @@ static void tip_init(struct thr_info *tip)
 
 	pthread_mutex_init(&tip->mutex, NULL);
 	pthread_cond_init(&tip->cond, NULL);
+
+	if (verbose)
+		printf("tip_init\n");
 
 	if (io_setup(naios, &tip->ctx)) {
 		fatal("io_setup", ERR_SYSCALL, "io_setup failed\n");
@@ -900,7 +932,9 @@ static void add_input_file(int cpu, char *devnm, char *file_name)
 	}
 
 	if (hdr.nbunches == 0) {
+		printf("hdr.nbunches = 0\n");
 empty_file:
+		if (verbose)
 		close(tip->ifd);
 		free(tip);
 		return;
@@ -1117,7 +1151,8 @@ static void *replay_rec(void *arg)
  */
 static int next_bunch(struct thr_info *tip, struct io_bunch *bunch)
 {
-	size_t count, result;
+	size_t count, result, dsize;
+	int i;
 	
 	result = read(tip->ifd, &bunch->hdr, sizeof(bunch->hdr));
 	if (result != sizeof(bunch->hdr)) {
@@ -1130,13 +1165,32 @@ static int next_bunch(struct thr_info *tip, struct io_bunch *bunch)
 	}
 	assert(bunch->hdr.npkts <= BT_MAX_PKTS);
 
-	count = bunch->hdr.npkts * sizeof(struct io_pkt);
-	result = read(tip->ifd, &bunch->pkts, count);
-	if (result != count) {
-		fatal(tip->file_name, ERR_SYSCALL, "Short pkts(%ld/%ld)\n", 
-			(long)result, (long)count);
-		/*NOTREACHED*/
+	if (verbose)
+		printf("next_bunch\n");
+
+	for (i = 0; i < bunch->hdr.npkts; i++) {
+		result = read(tip->ifd, &bunch->pkts[i], sizeof(struct io_pkt));
+		if (result != sizeof(struct io_pkt))
+			fatal(tip->file_name, ERR_SYSCALL, "Short pkts(%ld/%ld)\n", 
+				(long)result, (long)count);
+
+		dsize = 16 * (bunch->pkts[i].nbytes/4096);
+		bunch->pkts[i].digests = malloc(dsize);
+		result = read(tip->ifd, bunch->pkts[i].digests, dsize);
+		if (result != dsize)
+			fatal(tip->file_name, ERR_SYSCALL, "Short pkts(%ld/%ld)\n", 
+				(long)result, (long)count);
+
+		// rkj
 	}
+
+//	count = bunch->hdr.npkts * sizeof(struct io_pkt);
+//	result = read(tip->ifd, &bunch->pkts, count);
+//	if (result != count) {
+//		fatal(tip->file_name, ERR_SYSCALL, "Short pkts(%ld/%ld)\n", 
+//			(long)result, (long)count);
+//		/*NOTREACHED*/
+//	}
 
 	return 1;
 }
@@ -1233,7 +1287,8 @@ static void iocbs_map(struct thr_info *tip, struct iocb **list,
 				(rw == 1 && pkt->rw == 0) ? '!' : ' ');
 		
 		iocbp = list_entry(tip->free_iocbs.next, struct iocb_pkt, head);
-		iocb_setup(iocbp, rw, pkt->nbytes, pkt->sector * nb_sec);
+		iocb_setup(iocbp, rw, pkt->nbytes, pkt->sector * nb_sec, pkt->digests);
+		free(pkt->digests);
 
 		list_move_tail(&iocbp->head, &tip->used_iocbs);
 		list[i] = &iocbp->iocb;
@@ -1317,6 +1372,9 @@ static void *replay_sub(void *arg)
 	char path[MAXPATHLEN];
 	struct io_bunch bunch;
 	struct thr_info *tip = arg;
+
+	if (verbose)
+		printf("replay_sub\n");
 
 	pin_to_cpu(tip);
 
@@ -1529,7 +1587,7 @@ static void handle_args(int argc, char *argv[])
 			/*NOTREACHED*/
 
 		case 'v':
-			verbose++;
+			verbose = 3;
 			break;
 
 		case 'W':
@@ -1594,7 +1652,10 @@ int main(int argc, char *argv[])
 	find_input_files();
 
 	nfiles = list_len(&input_files);
+	printf("nfiles=%d\n", nfiles);
 	__list_for_each(p, &input_files) {
+		if (verbose)
+			printf("tip_init\n");
 		tip_init(list_entry(p, struct thr_info, head));
 	}
 

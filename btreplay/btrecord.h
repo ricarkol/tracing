@@ -47,6 +47,7 @@ struct io_pkt {
 	__u64 sector;
 	__u64 nbytes;
 	__u32 rw;
+	unsigned char *digests;
 };
 
 /*
