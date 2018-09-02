@@ -97,6 +97,7 @@ struct dev_info {
  * @file_name: 	Full name of the input file
  * @cpu: 	CPU this thread is pinned to
  * @ifd: 	Input file descriptor
+ * @ifp		Input file pointer
  * @ofd: 	Output file descriptor
  * @iterations: Remaining iterations to process
  * @vfp:	For verbose dumping of actions performed
@@ -111,6 +112,7 @@ struct thr_info {
 	io_context_t ctx;
 	char *devnm, *file_name;
 	int cpu, ifd, ofd, iterations;
+	FILE *ifp;
 	FILE *vfp;
 };
 
@@ -156,6 +158,7 @@ static int nfiles = 0;			// Number of files to handle
 static int no_stalls = 0;		// Boolean: Disable pre-stalls
 static unsigned acc_factor = 1;		// Int: Acceleration factor
 static int find_records = 0;		// Boolean: Find record files auto
+static int digest_len = 32;		// Digest bytes per page
 
 /*
  * Variables managed under control of condition variables.
@@ -201,21 +204,6 @@ static char usage_str[];
  * ==== INLINE ROUTINES ===================================================
  * ========================================================================
  */
-
-/*
- * Copy digest into buf in readable Hex format
- */
-void MD5Human(unsigned char digest[16], char *buf)
-{
-        int i, s;
-
-        for (i = 0; i < 16; i++) {
-                s = sprintf(buf, "%02x", digest[i]);
-                buf += s;
-        }
-        *buf = '\0';
-}
-
 
 /*
  * The 'fatal' macro will output a perror message (if errstring is !NULL)
@@ -324,11 +312,10 @@ static inline void touch_memory(char *buf, size_t bsize)
 #if defined(PREP_BUFS)
 	memset(buf, 0, bsize);
 #else
-	memset(buf, 0, bsize);
-//	size_t i;
+	size_t i;
 
-//	for (i = 0; i < bsize; i += pgsize)
-//		buf[i] = 0;
+	for (i = 0; i < bsize; i += pgsize)
+		buf[i] = 0;
 #endif
 }
 
@@ -730,7 +717,6 @@ static void iocb_setup(struct iocb_pkt *iocbp, int rw, int n, long long off, cha
 	char *buf, *d, *b;
 	int i;
 	struct iocb *iop = &iocbp->iocb;
-	char temp_buf[64];
 
 	assert(rw == 0 || rw == 1);
 	assert(0 < n && (n % nb_sec) == 0);
@@ -761,10 +747,9 @@ prep:
 		b = buf;
 		for (i = 0; i < n / 4096; i++) {
 			if (verbose)
-				printf("print page %d\n", i);
-			MD5Human(d, temp_buf);
-			d += 16;
-			memcpy(b, temp_buf, strlen(temp_buf));
+				printf("Write page lbn=%d %s\n", off / 512, d);
+			memcpy(b, d, digest_len);
+			d += digest_len;
 			b += 4096;
 		}
 	}
@@ -904,10 +889,15 @@ static void add_input_file(int cpu, char *devnm, char *file_name)
 		fatal(file_name, ERR_ARGS, "Unable to open\n");
 		/*NOTREACHED*/
 	}
+
+	tip->ifp = fdopen(tip->ifd, "r");
+	assert(tip->ifp != NULL);
+
 	if (fstat(tip->ifd, &buf) < 0) {
 		fatal(file_name, ERR_SYSCALL, "fstat failed\n");
 		/*NOTREACHED*/
 	}
+#if 0
 	if (buf.st_size < (off_t)sizeof(hdr)) {
 		if (verbose)
 			fprintf(stderr, "\t%s empty\n", file_name);
@@ -932,9 +922,7 @@ static void add_input_file(int cpu, char *devnm, char *file_name)
 	}
 
 	if (hdr.nbunches == 0) {
-		printf("hdr.nbunches = 0\n");
 empty_file:
-		if (verbose)
 		close(tip->ifd);
 		free(tip);
 		return;
@@ -947,7 +935,7 @@ empty_file:
 				du64_to_nsec(hdr.genesis));
 		genesis = hdr.genesis;
 	}
-
+#endif
 	tip->devnm = strdup(devnm);
 	tip->file_name = strdup(file_name);
 
@@ -1043,7 +1031,7 @@ static int reap_wait_aios(struct thr_info *tip)
 
 	if (!is_reap_done(tip)) {
 		pthread_mutex_lock(&tip->mutex);
-		while (tip->naios_out == 0) {
+		while (tip->naios_out == 0 && !tip->send_done) {
 			tip->reap_wait = 1;
 			if (pthread_cond_wait(&tip->cond, &tip->mutex)) {
 				fatal("pthread_cond_wait", ERR_SYSCALL, 
@@ -1126,8 +1114,9 @@ static void *replay_rec(void *arg)
 	long naios_out;
 	struct thr_info *tip = arg;
 
-	while ((naios_out = reap_wait_aios(tip)) > 0) 
+	while ((naios_out = reap_wait_aios(tip)) > 0) {
 		reclaim_ios(tip, naios_out);
+	}
 
 	assert(tip->send_done);
 	tip->reap_done = 1;
@@ -1149,49 +1138,54 @@ static void *replay_rec(void *arg)
  *
  * Returns TRUE if we recovered a bunch of IOs, else hit EOF
  */
+static int first_record = 1;
 static int next_bunch(struct thr_info *tip, struct io_bunch *bunch)
 {
-	size_t count, result, dsize;
+	size_t count, dsize;
+	int result;
 	int i;
-	
-	result = read(tip->ifd, &bunch->hdr, sizeof(bunch->hdr));
-	if (result != sizeof(bunch->hdr)) {
-		if (result == 0)
-			return 0;
+	__u64 _genesis;
+	__u64 sector;
+	__u64 nbytes, nsectors;
+	int nrpages;
+	__u32 rw;
+	__u32 pid;
+	__u32 major, minor;
+	char dir;
+	char proc[256];
+	char digest[digest_len * MAX_NSECTORS];
 
-		fatal(tip->file_name, ERR_SYSCALL, "Short hdr(%ld)\n", 
-			(long)result);
-		/*NOTREACHED*/
-	}
-	assert(bunch->hdr.npkts <= BT_MAX_PKTS);
-
-	if (verbose)
-		printf("next_bunch\n");
-
-	for (i = 0; i < bunch->hdr.npkts; i++) {
-		result = read(tip->ifd, &bunch->pkts[i], sizeof(struct io_pkt));
-		if (result != sizeof(struct io_pkt))
-			fatal(tip->file_name, ERR_SYSCALL, "Short pkts(%ld/%ld)\n", 
-				(long)result, (long)count);
-
-		dsize = 16 * (bunch->pkts[i].nbytes/4096);
-		bunch->pkts[i].digests = malloc(dsize);
-		result = read(tip->ifd, bunch->pkts[i].digests, dsize);
-		if (result != dsize)
-			fatal(tip->file_name, ERR_SYSCALL, "Short pkts(%ld/%ld)\n", 
-				(long)result, (long)count);
-
-		// rkj
+	// 89966740305212 4253 nfsd 519854400 8 W 6 0 4a5e42f2c805cf21ed90154976ce4b13
+	result = fscanf(tip->ifp, "%llu %lu %s %llu %d %c %u %u %s\n",
+		&_genesis, &pid, proc, &sector, &nsectors, &dir,
+		&major, &minor, digest);
+	if (result < 9 || result == EOF) {
+		return 0;
 	}
 
-//	count = bunch->hdr.npkts * sizeof(struct io_pkt);
-//	result = read(tip->ifd, &bunch->pkts, count);
-//	if (result != count) {
-//		fatal(tip->file_name, ERR_SYSCALL, "Short pkts(%ld/%ld)\n", 
-//			(long)result, (long)count);
-//		/*NOTREACHED*/
-//	}
+	/* content traces are basically one IO per bunch */
+	bunch->hdr.npkts = 1;
 
+	if (first_record) {
+		genesis = _genesis;
+		first_record = 0;
+	}
+
+	//printf("-- %llu %lu %s %llu %llu %c %u %u %s --\n",
+	//	genesis, pid, proc, sector, nsectors, dir, major, minor, digest);
+
+	// TODO: this makes things easy. Consider fixing it.
+	assert(nsectors <= MAX_NSECTORS);
+
+	// TODO: what about smaller than a page size IOs?
+	assert(nsectors % 8 == 0);
+	nrpages = nsectors / 8;
+
+	bunch->hdr.time_stamp = _genesis;
+	bunch->pkts[0].sector = sector;
+	bunch->pkts[0].nbytes = nsectors * 512;
+	bunch->pkts[0].rw = dir == 'W' ? 0 : 1;
+	memcpy(bunch->pkts[0].digests, digest, nrpages * digest_len);
 	return 1;
 }
 
@@ -1288,7 +1282,6 @@ static void iocbs_map(struct thr_info *tip, struct iocb **list,
 		
 		iocbp = list_entry(tip->free_iocbs.next, struct iocb_pkt, head);
 		iocb_setup(iocbp, rw, pkt->nbytes, pkt->sector * nb_sec, pkt->digests);
-		free(pkt->digests);
 
 		list_move_tail(&iocbp->head, &tip->used_iocbs);
 		list[i] = &iocbp->iocb;
@@ -1378,7 +1371,7 @@ static void *replay_sub(void *arg)
 
 	pin_to_cpu(tip);
 
-	sprintf(path, "/dev/%s", map_dev(tip->devnm));
+	sprintf(path, "%s", map_dev(tip->devnm));
 	tip->ofd = open(path, O_RDWR | O_DIRECT | O_NOATIME);
 	if (tip->ofd < 0) {
 		fatal(path, ERR_SYSCALL, "Failed device open\n");
@@ -1397,6 +1390,10 @@ static void *replay_sub(void *arg)
 	}
 	tip->send_done = 1;
 	set_replay_done();
+	pthread_mutex_lock(&tip->mutex);
+	if (tip->reap_wait)
+		pthread_cond_signal(&tip->cond);
+	pthread_mutex_unlock(&tip->mutex);
 
 	return NULL;
 }
@@ -1410,6 +1407,7 @@ static void *replay_sub(void *arg)
 static char usage_str[] = 						\
         "\n"								\
         "\t[ -c <cpus> : --cpus=<cpus>           ] Default: 1\n"        \
+        "\t[ -l <digest_len> : --digest-len=<len>] Default: 32\n"        \
         "\t[ -d <dir>  : --input-directory=<dir> ] Default: .\n"        \
 	"\t[ -F        : --find-records          ] Default: Off\n"	\
         "\t[ -h        : --help                  ] Default: Off\n"      \
@@ -1424,13 +1422,19 @@ static char usage_str[] = 						\
         "\t<dev...>                                Default: None\n"     \
         "\n";
 
-#define S_OPTS	"c:d:Fhi:I:M:Nx:t:vVW"
+#define S_OPTS	"c:l:d:Fhi:I:M:Nx:t:vVW"
 static struct option l_opts[] = {
 	{
 		.name = "cpus",
 		.has_arg = required_argument,
 		.flag = NULL,
 		.val = 'c'
+	},
+	{
+		.name = "digest-len",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'l'
 	},
 	{
 		.name = "input-directory",
@@ -1526,6 +1530,16 @@ static void handle_args(int argc, char *argv[])
 				/*NOTREACHED*/
 			}
 			break;
+		case 'l': 
+			digest_len = atoi(optarg);
+			if (digest_len != 32 && digest_len != (32 * 8)) {
+				fatal(NULL, ERR_ARGS, 
+				      "Invalid digest length (bytes per page): %d\n",
+				      digest_len);
+				/*NOTREACHED*/
+			}
+			break;
+
 
 		case 'd':
 			idir = optarg;
@@ -1587,7 +1601,7 @@ static void handle_args(int argc, char *argv[])
 			/*NOTREACHED*/
 
 		case 'v':
-			verbose = 3;
+			verbose++;
 			break;
 
 		case 'W':
@@ -1652,7 +1666,6 @@ int main(int argc, char *argv[])
 	find_input_files();
 
 	nfiles = list_len(&input_files);
-	printf("nfiles=%d\n", nfiles);
 	__list_for_each(p, &input_files) {
 		if (verbose)
 			printf("tip_init\n");

@@ -36,6 +36,8 @@ struct io_bunch_hdr {
 	__u64 time_stamp;
 };
 
+#define MAX_NSECTORS 64
+
 /*
  * IO specifer
  *
@@ -47,7 +49,7 @@ struct io_pkt {
 	__u64 sector;
 	__u64 nbytes;
 	__u32 rw;
-	unsigned char *digests;
+	unsigned char digests[32 * MAX_NSECTORS];
 };
 
 /*

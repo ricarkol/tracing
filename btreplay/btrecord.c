@@ -510,7 +510,7 @@ again:
 	assert(data_is_native >= 0);
 	if (data_is_native) {
 		spec->time = t.time;
-		spec->sector = 123; //t.sector;
+		spec->sector = t.sector;
 		spec->bytes = t.bytes;
 		action = t.action;
 		pdu_len = t.pdu_len;
@@ -612,7 +612,7 @@ static inline void bunch_output_pkts(struct io_stream *stream)
 		for (i = 0; i < npkts; i++, p++)
 			fprintf(stream->vfp, "\t%1d %10llu\t%10llu\n",
 				p->rw, 
-				(unsigned long long)123,
+				(unsigned long long)p->sector,
 				(unsigned long long)p->nbytes / 512);
 	}
 }
