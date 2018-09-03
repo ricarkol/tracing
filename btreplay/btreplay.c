@@ -958,6 +958,7 @@ static void rem_input_file(struct thr_info *tip)
 
 	close(tip->ofd);
 	close(tip->ifd);
+	fclose(tip->ifp);
 	free(tip->file_name);
 	free(tip->devnm);
 	free(tip);
