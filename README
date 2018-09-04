@@ -14,7 +14,7 @@ There are a couple of important details:
 Issues
 ------
 
-- There might be many btreplay arguments that don't work anymore. Only tested the ones in `test_btreplay.sh`.
+- There might be many btreplay arguments that don't work anymore. Only tested the ones in test_btreplay.sh.
 
 Acknowledgements
 ----------------
