@@ -15,6 +15,8 @@ Issues
 ------
 
 - There might be many btreplay arguments that don't work anymore. Only tested the ones in test_btreplay.sh.
+- Bunches are of size 1, even if there is a bunch of reads or writes with the same timestamp.
+- There is aproblem with "important detail" number 1. above. If there is a sequence like `read(lbn=123, abc), write(lbn=123, def), read(lbn=123, def)`, then the disk will start with data in `lbn=123` as `def`.
 
 Acknowledgements
 ----------------
